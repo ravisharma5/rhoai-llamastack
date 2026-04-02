@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: openshift-mcp-server
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openshift-mcp-server-view
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: openshift-mcp-server
+    namespace: llama-stack
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-mcp-server
+  labels:
+    app: openshift-mcp-server
+    app.kubernetes.io/component: mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openshift-mcp-server
+  template:
+    metadata:
+      labels:
+        app: openshift-mcp-server
+        app.kubernetes.io/component: mcp-server
+    spec:
+      serviceAccountName: openshift-mcp-server
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mcp-server
+          image: quay.io/containers/kubernetes_mcp_server:latest
+          args:
+            - "--port"
+            - "8080"
+            - "--disable-destructive"
+            - "--toolsets"
+            - "core,config,helm"
+            - "--stateless"
+            - "--cluster-provider"
+            - "in-cluster"
+          ports:
+            - name: http
+              containerPort: 8080
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openshift-mcp-server
+  labels:
+    app: openshift-mcp-server
+spec:
+  selector:
+    app: openshift-mcp-server
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+  type: ClusterIP
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: openshift-mcp-server
+  labels:
+    app: openshift-mcp-server
+spec:
+  to:
+    kind: Service
+    name: openshift-mcp-server
+  port:
+    targetPort: http
+  tls:
+    termination: edge

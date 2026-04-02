@@ -1,0 +1,8 @@
+# Local secret overrides
+llama-stack-secret.local.yaml
+*.local.yaml
+
+# Environment files
+.env
+.env.*
+!.env.example

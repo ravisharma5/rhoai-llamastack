@@ -1,0 +1,99 @@
+apiVersion: llamastack.io/v1alpha1
+kind: LlamaStackDistribution
+metadata:
+  name: llama-stack-server
+spec:
+  replicas: 1
+  network:
+    exposeRoute: true
+    allowedFrom:
+      namespaces:
+        - "*"
+  server:
+    distribution:
+      name: rh-dev
+    userConfig:
+      configMapName: llama-stack-run-config
+    containerSpec:
+      port: 8321
+      env:
+        # Inference model config (from secret)
+        - name: INFERENCE_MODEL
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: INFERENCE_MODEL
+        - name: VLLM_URL
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VLLM_URL
+        - name: VLLM_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VLLM_API_TOKEN
+        - name: VLLM_TLS_VERIFY
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VLLM_TLS_VERIFY
+        - name: VLLM_MAX_TOKENS
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VLLM_MAX_TOKENS
+        # Embedding config (from secret)
+        - name: EMBEDDING_MODEL
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: EMBEDDING_MODEL
+        - name: EMBEDDING_PROVIDER_MODEL_ID
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: EMBEDDING_PROVIDER_MODEL_ID
+        - name: EMBEDDING_DIMENSION
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: EMBEDDING_DIMENSION
+        - name: VLLM_EMBEDDING_URL
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VLLM_EMBEDDING_URL
+        - name: VLLM_EMBEDDING_API_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VLLM_EMBEDDING_API_TOKEN
+        - name: VLLM_EMBEDDING_TLS_VERIFY
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VLLM_EMBEDDING_TLS_VERIFY
+        # PostgreSQL config
+        - name: POSTGRES_HOST
+          value: "postgres-llamastack"
+        - name: POSTGRES_PORT
+          value: "5432"
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: postgres-llamastack-secret
+              key: POSTGRESQL_DATABASE
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-llamastack-secret
+              key: POSTGRESQL_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-llamastack-secret
+              key: POSTGRESQL_PASSWORD
+    storage:
+      size: "10Gi"
+      mountPath: "/opt/app-root/src/.llama"
