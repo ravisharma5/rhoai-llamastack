@@ -74,6 +74,32 @@ spec:
             secretKeyRef:
               name: llama-stack-inference-secret
               key: VLLM_EMBEDDING_TLS_VERIFY
+        # Victoria Metrics MCP servers
+        - name: VLOGS_URL
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VLOGS_URL
+        - name: VLOGS_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VLOGS_TOKEN
+        - name: VCPC_URL
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VCPC_URL
+        - name: VCPC_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VCPC_TOKEN
+        - name: VCPC_TENANT
+          valueFrom:
+            secretKeyRef:
+              name: llama-stack-inference-secret
+              key: VCPC_TENANT
         # PostgreSQL config
         - name: POSTGRES_HOST
           value: "postgres-llamastack"

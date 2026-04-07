@@ -151,6 +151,14 @@ registered_resources:
       provider_id: model-context-protocol
       mcp_endpoint:
         uri: http://openshift-mcp-server:8080/sse
+    - toolgroup_id: mcp::vlogs
+      provider_id: model-context-protocol
+      mcp_endpoint:
+        uri: ${env.VLOGS_URL}
+    - toolgroup_id: mcp::vcpc-metrics
+      provider_id: model-context-protocol
+      mcp_endpoint:
+        uri: ${env.VCPC_URL}
 
   shields: []
   vector_stores: []
