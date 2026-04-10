@@ -11,26 +11,28 @@ External vLLM Endpoints
          v
 +---------------------+         +-------------------------+
 | LlamaStack Server   |--SSE--->| OpenShift MCP Server    |
-| (rh-dev, port 8321) |         | (port 8080)             |
-|                     |         |                         |
-| Providers:          |         | Tools:                  |
-|  - vllm-inference   |         |   pods_list/get/log     |
-|  - vllm-embedding   |         |   resources_get/create  |
-|  - milvus (inline)  |         |   events_list           |
-|  - rag-runtime      |         |   namespaces_list       |
-|  - model-context-   |         |   helm_install/list/rm  |
-|    protocol         |         +-------------------------+
-|                     |                  |
-| Tool Groups:        |             in-cluster SA
-|  - builtin::rag     |                  |
-|  - builtin::websearch                  v
-|  - mcp::openshift   |         OpenShift API Server
-+---------------------+
-         |
-         v
-+---------------------+
-| PostgreSQL          |
-| (KV + SQL storage)  |
+| (rh-dev, port 8321) |         | (local, port 8080)      |
+|                     |         |   --cluster-provider     |
+| Providers:          |         |     in-cluster           |
+|  - vllm-inference   |         +-------------------------+
+|  - vllm-embedding   |                  |
+|  - milvus (inline)  |             in-cluster SA
+|  - rag-runtime      |                  |
+|  - model-context-   |                  v
+|    protocol         |         Local OpenShift API Server
+|                     |
+| Tool Groups:        |         +-------------------------+
+|  - builtin::rag     |--SSE--->| OpenShift MCP Server    |
+|  - builtin::websearch         | (remote, port 8080)     |
+|  - mcp::openshift   |         |   --kubeconfig          |
+|  - mcp::openshift-  |         |     /etc/mcp/kubeconfig  |
+|    remote (optional) |         +-------------------------+
++---------------------+                  |
+         |                          kubeconfig +
+         v                          SA token
++---------------------+                  |
+| PostgreSQL          |                  v
+| (KV + SQL storage)  |         Remote OpenShift API Server
 +---------------------+
 ```
 
@@ -49,7 +51,7 @@ External vLLM Endpoints
 |------|-------------|
 | `llama-stack-secret.yaml` | Secret template (parameterized -- values come from `.env`) |
 | `postgres.yaml` | PostgreSQL deployment (Secret + PVC + Deployment + Service) |
-| `openshift-mcp-server.yaml` | MCP server (Deployment + Service + Route + ServiceAccount + RBAC) |
+| `openshift-mcp-server.yaml` | MCP server for local cluster (Deployment + Service + Route + SA + RBAC) |
 | `llamastackdistribution.yaml` | LlamaStackDistribution CR (the main LlamaStack server) |
 | `llamastack-config.yaml` | LlamaStack config with providers, models, and tool groups |
 | `mcp-playground-configmap.yaml` | (Optional) Register MCP server in RHOAI Gen AI Playground |
@@ -141,7 +143,7 @@ curl -sk $LLAMA_URL/v1/toolgroups
 
 ### Responses API (recommended)
 
-The `/v1/responses` API runs a full agent loop server-side: tool discovery, LLM-driven tool selection, tool execution via MCP, and final response generation.
+The `/v1/responses` API handles the full agent loop server-side -- it discovers available tools, lets the LLM pick which ones to call, executes them via MCP, and returns the final response.
 
 ```python
 import requests
@@ -264,6 +266,235 @@ router.
 | `helm` | install, list, remove Helm charts | Yes |
 | `kubevirt` | VM management (OpenShift Virtualization) | No |
 | `observability` | Prometheus metrics, Alertmanager | No |
+
+## Adding a Remote OpenShift Cluster
+
+The default `openshift-mcp-server` uses an in-cluster ServiceAccount to talk to the local cluster. To reach a different OpenShift cluster, deploy a second MCP server pod with a kubeconfig that points at it.
+
+### 1. Create a ServiceAccount on the remote cluster
+
+Log in to the remote cluster and create a read-only ServiceAccount:
+
+```bash
+# Log in to the remote cluster
+oc login https://api.remote-cluster.example.com:6443
+
+# Create namespace and ServiceAccount
+oc new-project mcp
+oc create sa mcp-viewer -n mcp
+
+# Grant cluster-wide read access
+oc adm policy add-cluster-role-to-user cluster-reader \
+  system:serviceaccount:mcp:mcp-viewer
+```
+
+### 2. Generate a token and build a kubeconfig
+
+```bash
+# Generate a time-bound token (adjust duration as needed)
+TOKEN="$(oc -n mcp create token mcp-viewer --duration=8h)"
+API_SERVER="$(oc whoami --show-server)"
+
+# Build a dedicated kubeconfig file
+oc login --server="$API_SERVER" --token="$TOKEN" \
+  --kubeconfig="$HOME/.kube/mcp-remote.kubeconfig"
+
+# Verify
+oc --kubeconfig="$HOME/.kube/mcp-remote.kubeconfig" get nodes
+```
+
+> **Note:** ServiceAccount tokens expire after the specified duration. You will
+> need to regenerate the token and update the Secret when it expires. Use longer
+> durations for development (`--duration=168h` for 7 days).
+
+### 3. Create a Secret with the kubeconfig on the LlamaStack cluster
+
+Switch back to the LlamaStack cluster and store the kubeconfig as a Secret:
+
+```bash
+# Log in to the LlamaStack cluster
+oc login https://api.llamastack-cluster.example.com:6443
+oc project llama-stack
+
+# Create the Secret from the kubeconfig file
+oc create secret generic remote-cluster-kubeconfig \
+  --from-file=kubeconfig=$HOME/.kube/mcp-remote.kubeconfig
+```
+
+### 4. Deploy the remote MCP server
+
+Create `openshift-mcp-server-remote.yaml`:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openshift-mcp-server-remote
+  labels:
+    app: openshift-mcp-server-remote
+    app.kubernetes.io/component: mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: openshift-mcp-server-remote
+  template:
+    metadata:
+      labels:
+        app: openshift-mcp-server-remote
+        app.kubernetes.io/component: mcp-server
+    spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mcp-server
+          image: quay.io/containers/kubernetes_mcp_server:latest
+          args:
+            - "--port"
+            - "8080"
+            - "--disable-destructive"
+            - "--toolsets"
+            - "core,config,helm"
+            - "--kubeconfig"
+            - "/etc/mcp/kubeconfig"
+            - "--disable-multi-cluster"
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: kubeconfig
+              mountPath: /etc/mcp
+              readOnly: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+      volumes:
+        - name: kubeconfig
+          secret:
+            secretName: remote-cluster-kubeconfig
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: openshift-mcp-server-remote
+  labels:
+    app: openshift-mcp-server-remote
+spec:
+  selector:
+    app: openshift-mcp-server-remote
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+  type: ClusterIP
+```
+
+Deploy it:
+
+```bash
+oc apply -f openshift-mcp-server-remote.yaml
+oc wait --for=condition=available deployment/openshift-mcp-server-remote --timeout=120s
+```
+
+### 5. Register the toolgroup in LlamaStack config
+
+Add the new toolgroup to `llamastack-config.yaml` under `tool_groups`:
+
+```yaml
+tool_groups:
+  # ... existing toolgroups ...
+  - toolgroup_id: mcp::openshift-remote
+    provider_id: model-context-protocol
+    mcp_endpoint:
+      uri: http://openshift-mcp-server-remote:8080/sse
+```
+
+Update the ConfigMap:
+
+```bash
+oc create configmap llama-stack-run-config \
+  --from-file=config.yaml=llamastack-config.yaml \
+  --dry-run=client -o yaml | oc apply -f -
+```
+
+Restart LlamaStack to pick up the new toolgroup:
+
+```bash
+oc rollout restart deployment/llama-stack-server
+```
+
+### 6. Query the remote cluster
+
+Use the Responses API with the `openshift-remote` server label:
+
+```python
+response = requests.post(
+    f"{LLAMA_STACK_URL}/v1/responses",
+    json={
+        "model": "your-inference-model",
+        "input": "List all pods in the default namespace",
+        "tools": [
+            {
+                "type": "mcp",
+                "server_label": "openshift-remote",
+                "server_url": "http://openshift-mcp-server-remote:8080/sse",
+                "require_approval": "never",
+            }
+        ],
+        "stream": False,
+    },
+    verify=False,
+    timeout=120,
+).json()
+```
+
+The `server_label` controls which cluster gets the request: `"openshift"` hits the local cluster, `"openshift-remote"` hits the remote one. To add more clusters, repeat steps 1-5 with different names.
+
+### Token renewal
+
+When the SA token expires, regenerate it and update the Secret:
+
+```bash
+# On the remote cluster
+oc login https://api.remote-cluster.example.com:6443
+TOKEN="$(oc -n mcp create token mcp-viewer --duration=8h)"
+API_SERVER="$(oc whoami --show-server)"
+oc login --server="$API_SERVER" --token="$TOKEN" \
+  --kubeconfig="$HOME/.kube/mcp-remote.kubeconfig"
+
+# On the LlamaStack cluster
+oc login https://api.llamastack-cluster.example.com:6443
+oc project llama-stack
+oc create secret generic remote-cluster-kubeconfig \
+  --from-file=kubeconfig=$HOME/.kube/mcp-remote.kubeconfig \
+  --dry-run=client -o yaml | oc apply -f -
+
+# Restart the MCP server to pick up the new token
+oc rollout restart deployment/openshift-mcp-server-remote
+```
 
 ## Updating Configuration
 
