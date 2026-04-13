@@ -517,6 +517,38 @@ oc delete -f postgres.yaml
 envsubst < llama-stack-secret.yaml | oc delete -f -
 ```
 
+## Claude Code skill
+
+This repo includes a LlamaStack skill for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) at `.claude/skills/llamastack/SKILL.md`. It gives Claude context about LlamaStack APIs, deployment patterns, MCP integration, and common gotchas so it can help you work with this project.
+
+### What it covers
+
+- LlamaStack v0.4.x API reference (Responses API, tool invocation, chat completions)
+- MCP server registration and auth patterns (config-level vs request-time)
+- OpenShift deployment with the LlamaStackDistribution CR
+- Config file reference (`config.yaml` with env var interpolation)
+- 9 gotchas that will save you debugging time (silent field name mismatches, missing routes, etc.)
+
+### Setup
+
+The skill loads automatically when you use Claude Code inside this project directory. No extra setup needed -- Claude Code reads `.claude/skills/` from the repo root.
+
+You can invoke it directly:
+
+```
+/llamastack deploy    # deployment help
+/llamastack api       # API reference
+/llamastack mcp       # MCP server integration
+/llamastack gotchas   # common pitfalls
+```
+
+Or just ask questions naturally and Claude will pull from the skill when relevant.
+
+### Requirements
+
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
+- Run `claude` from this repo's root directory
+
 ## Troubleshooting
 
 **LlamaStack pod in CrashLoopBackOff:**
