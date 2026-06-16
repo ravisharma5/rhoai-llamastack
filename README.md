@@ -1,6 +1,8 @@
-# LlamaStack on RHOAI 3.3
+# OGX (formerly LlamaStack) on RHOAI 3.4
 
-Deploy a LlamaStack server with MCP server integration on OpenShift AI 3.3 using the LlamaStackDistribution custom resource.
+Deploy an OGX server with MCP server integration on OpenShift AI 3.4 using the LlamaStackDistribution custom resource.
+
+> **Migration note:** OGX v0.7.1 ships with RHOAI 3.4, replacing LlamaStack v0.4.x from RHOAI 3.3. See [Migration from RHOAI 3.3](#migration-from-rhoai-33) for breaking changes.
 
 ## Architecture
 
@@ -10,54 +12,42 @@ External vLLM Endpoints
          |
          v
 +---------------------+         +-------------------------+
-| LlamaStack Server   |--SSE--->| OpenShift MCP Server    |
-| (rh-dev, port 8321) |         | (local, port 8080)      |
-|                     |         |   --cluster-provider     |
-| Providers:          |         |     in-cluster           |
+| OGX Server          |--SSE--->| OpenShift MCP Server    |
+| (port 8321)         |         | (port 8080)             |
+|                     |         +-------------------------+
+| Providers:          |
 |  - vllm-inference   |         +-------------------------+
-|  - vllm-embedding   |                  |
-|  - milvus (inline)  |             in-cluster SA
-|  - rag-runtime      |                  |
-|  - model-context-   |                  v
-|    protocol         |         Local OpenShift API Server
-|                     |
-| Tool Groups:        |         +-------------------------+
-|  - builtin::rag     |--SSE--->| OpenShift MCP Server    |
-|  - builtin::websearch         | (remote, port 8080)     |
-|  - mcp::openshift   |         |   --kubeconfig          |
-|  - mcp::openshift-  |         |     /etc/mcp/kubeconfig  |
-|    remote (optional) |         +-------------------------+
-+---------------------+                  |
-         |                          kubeconfig +
-         v                          SA token
-+---------------------+                  |
-| PostgreSQL          |                  v
-| (KV + SQL storage)  |         Remote OpenShift API Server
+|    (remote::vllm)   |--SSE--->| VictoriaMetrics MCP     |
+|  - vllm-embedding   |         | Aggregator (port 8000)  |
+|    (remote::vllm)   |         +-------------------------+
+|  - inline::builtin  |
+|    (responses)      |         +-------------------------+
+|  - model-context-   |--SSE--->| Incident Detection MCP  |
+|    protocol         |         | (port 8085)             |
+|                     |         +-------------------------+
+| APIs:               |
+|  - inference         |
+|  - responses         |
+|  - tool_runtime      |
+|  - vector_io         |
+|  - files             |
++---------------------+
+         |
+         v
++---------------------+
+| PostgreSQL          |
+| (KV + SQL storage)  |
 +---------------------+
 ```
 
 ## Prerequisites
 
-- OpenShift AI 3.3 with the LlamaStack Operator activated
+- OpenShift AI 3.4 with the LlamaStack/OGX Operator activated
   (`llamastackoperator.managementState: Managed` in your DataScienceCluster CR)
 - `oc` CLI logged in to your cluster
-- `envsubst` available (part of `gettext` -- pre-installed on most systems)
+- `envsubst` available (part of `gettext`)
 - An external vLLM inference endpoint URL (ending in `/v1`) and API token
 - An external vLLM embedding endpoint URL and API token
-
-## Files
-
-| File | Description |
-|------|-------------|
-| `llama-stack-secret.yaml` | Secret template (parameterized -- values come from `.env`) |
-| `postgres.yaml` | PostgreSQL deployment (Secret + PVC + Deployment + Service) |
-| `openshift-mcp-server.yaml` | MCP server for local cluster (Deployment + Service + Route + SA + RBAC) |
-| `llamastackdistribution.yaml` | LlamaStackDistribution CR (the main LlamaStack server) |
-| `llamastack-config.yaml` | LlamaStack config with providers, models, and tool groups |
-| `mcp-playground-configmap.yaml` | (Optional) Register MCP server in RHOAI Gen AI Playground |
-| `deploy.sh` | One-command deployment script |
-| `teardown.sh` | Clean teardown script |
-| `.env.example` | Template for required environment variables |
 
 ## Quick Start
 
@@ -78,13 +68,12 @@ oc login --server=https://api.your-cluster.com:6443
 
 # 5. Verify
 oc get pods
-LLAMA_URL=https://$(oc get route llama-stack-server -o jsonpath='{.spec.host}')
-curl -sk $LLAMA_URL/v1/health
+OGX_URL=https://$(oc get route llama-stack-server -o jsonpath='{.spec.host}')
+curl -sk $OGX_URL/v1/health
+curl -sk $OGX_URL/v1/models
 ```
 
-## Manual Deployment
-
-If you prefer step-by-step control over the deployment:
+## Step-by-Step Deployment
 
 ### 1. Create namespace
 
@@ -96,160 +85,222 @@ oc new-project llama-stack
 
 ```bash
 cp .env.example .env
-# Edit .env with your values, then:
+# Edit .env with your values:
+#   VLLM_URL, VLLM_API_TOKEN
+#   VLLM_EMBEDDING_URL, VLLM_EMBEDDING_API_TOKEN
+#   POSTGRES_PASSWORD
 source .env
 envsubst < llama-stack-secret.yaml | oc apply -f -
 ```
 
-### 3. Create LlamaStack config
+### 3. Create OGX server config
+
+The config uses OGX v0.7.x schema. Key differences from v0.4.x:
+
+```yaml
+version: 2
+distro_name: rh                    # was: image_name
+
+apis:
+  - inference
+  - responses                      # was: agents
+  - tool_runtime
+  - vector_io
+  - files
+  # Removed: eval, scoring, datasetio, safety
+
+providers:
+  inference:
+    - provider_id: vllm-inference
+      provider_type: remote::vllm
+      config:
+        base_url: ${env.VLLM_URL}  # must be base_url, not url
+        max_tokens: 8192
+        api_token: ${env.VLLM_API_TOKEN}
+        network:                   # was: tls_verify (flat field)
+          tls:
+            verify: false
+
+  responses:                       # was: agents
+    - provider_id: builtin         # was: meta-reference
+      provider_type: inline::builtin  # was: inline::meta-reference
+      config:
+        persistence:
+          responses:
+            backend: sql_default
+            table_name: agents_responses
+
+  tool_runtime:
+    - provider_id: model-context-protocol
+      provider_type: remote::model-context-protocol
+      config: {}
+```
+
+Apply the ConfigMap:
 
 ```bash
 oc create configmap llama-stack-run-config \
   --from-file=config.yaml=llamastack-config.yaml
 ```
 
-### 4. Deploy components
+> **Important:** The ConfigMap key **must** be `config.yaml`. The operator mounts it at `/etc/llama-stack/config.yaml`.
+
+### 4. Deploy PostgreSQL
 
 ```bash
-# PostgreSQL
 oc apply -f postgres.yaml
 oc wait --for=condition=available deployment/postgres-llamastack --timeout=120s
+```
 
-# OpenShift MCP Server
+### 5. Deploy OpenShift MCP Server
+
+```bash
 oc apply -f openshift-mcp-server.yaml
 oc wait --for=condition=available deployment/openshift-mcp-server --timeout=120s
+```
 
-# LlamaStack
+### 6. Deploy OGX Server (LlamaStackDistribution CR)
+
+The CR tells the RHOAI operator to deploy and manage the OGX server:
+
+```yaml
+apiVersion: llamastack.rhoai.opendatahub.io/v1alpha1
+kind: LlamaStackDistribution
+metadata:
+  name: llama-stack-server
+spec:
+  replicas: 1
+  userConfig:                      # must be userConfig, not userConfigMapRef
+    configMapName: llama-stack-run-config
+  secretRef:
+    name: llama-stack-secret
+  network:
+    allowedFrom:
+      namespaces: ["*"]            # allows OpenShift router traffic
+```
+
+```bash
 oc apply -f llamastackdistribution.yaml
+```
 
-# Create a route for external access
+### 7. Create external route
+
+```bash
 oc create route edge llama-stack-server \
   --service=llama-stack-server-service --port=8321
 ```
 
-### 5. Verify
+### 8. Verify deployment
 
 ```bash
+# Check pods
 oc get pods
+
+# Follow logs
 oc logs -l app.kubernetes.io/instance=llama-stack-server -f
 
-LLAMA_URL=https://$(oc get route llama-stack-server -o jsonpath='{.spec.host}')
-curl -sk $LLAMA_URL/v1/health
-curl -sk $LLAMA_URL/v1/models
-curl -sk $LLAMA_URL/v1/toolgroups
+# Health check
+OGX_URL=https://$(oc get route llama-stack-server -o jsonpath='{.spec.host}')
+curl -sk $OGX_URL/v1/health
+
+# List models
+curl -sk $OGX_URL/v1/models
+
+# List registered toolgroups (still works in v0.7.x)
+curl -sk $OGX_URL/v1/toolgroups
 ```
 
-## Using MCP Tools
+## Responses API
 
-### Responses API (recommended)
+The `/v1/responses` API handles the full agent loop server-side: tool discovery, LLM-driven tool selection, execution, and response generation.
 
-The `/v1/responses` API handles the full agent loop server-side -- it discovers available tools, lets the LLM pick which ones to call, executes them via MCP, and returns the final response.
+### Basic query
 
 ```python
-import requests
+from llama_stack_client import LlamaStackClient
 
-LLAMA_STACK_URL = "https://<llama-stack-route-url>"
-MCP_SERVER_URL = "http://openshift-mcp-server:8080/sse"
+client = LlamaStackClient(base_url="https://<ogx-route-url>")
 
-response = requests.post(
-    f"{LLAMA_STACK_URL}/v1/responses",
-    json={
-        "model": "your-inference-model",
-        "input": "List all pods in the llama-stack namespace",
-        "tools": [
-            {
-                "type": "mcp",
-                "server_label": "openshift",
-                "server_url": MCP_SERVER_URL,
-                "require_approval": "never",
-            }
-        ],
-        "stream": False,
-    },
-    verify=False,
-    timeout=120,
-).json()
-
-for item in response["output"]:
-    if item["type"] == "mcp_call":
-        print(f"Tool: {item['name']}({item.get('arguments', '{}')})")
-    elif item["type"] == "mcp_call_output":
-        print(f"Output: {item['output'][:500]}")
-    elif item["type"] == "message":
-        content = item.get("content", "")
-        if isinstance(content, list):
-            for c in content:
-                if c.get("type") == "output_text":
-                    print(f"Assistant: {c['text']}")
+response = client.responses.create(
+    model="vllm-inference/your-model-id",
+    input="List all pods in the llama-stack namespace",
+    tools=[
+        {
+            "type": "mcp",
+            "server_label": "openshift",
+            "server_url": "http://openshift-mcp-server:8080/sse",
+            "require_approval": "never",
+        }
+    ],
+    stream=False,
+)
 ```
 
-### Direct tool invocation
+### New parameters in v0.7.x
 
-```bash
-curl -sk -X POST $LLAMA_URL/v1/tool-runtime/invoke \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tool_name": "pods_list_in_namespace",
-    "kwargs": {"namespace": "llama-stack"},
-    "tool_group_id": "mcp::openshift"
-  }'
+```python
+response = client.responses.create(
+    model="vllm-inference/your-model-id",
+    input="Investigate high CPU usage across all namespaces",
+    tools=mcp_tools,
+    stream=True,
+    instructions="You are an AIOps assistant...",
+    # New in v0.7.x:
+    parallel_tool_calls=True,       # concurrent MCP queries
+    max_output_tokens=4096,         # per-request output limit
+    max_tool_calls=10,              # total tool call cap
+    reasoning={"effort": "medium"}, # reasoning depth control
+    truncation="auto",              # was: extra_body={"truncation": "auto"}
+)
 ```
 
-## Important Notes
+| Parameter | Purpose | Default |
+|-----------|---------|---------|
+| `parallel_tool_calls` | Allow model to emit multiple tool calls per turn | `True` |
+| `max_output_tokens` | Per-request output token limit | Model default |
+| `max_tool_calls` | Cap total tool invocations per request | No limit |
+| `reasoning` | Control reasoning depth (`none`/`minimal`/`low`/`medium`/`high`/`xhigh`) | None |
+| `truncation` | Context window management strategy | None |
 
-### ConfigMap key must be `config.yaml`
+### Streaming events
 
-The operator mounts the ConfigMap at `/etc/llama-stack/` and sets
-`LLAMA_STACK_CONFIG=/etc/llama-stack/config.yaml`. The key **must** be `config.yaml`:
-
-```bash
-# Correct
-oc create configmap llama-stack-run-config --from-file=config.yaml=llamastack-config.yaml
-
-# Wrong -- causes "Could not resolve config" error
-oc create configmap llama-stack-run-config --from-file=run.yaml=llamastack-config.yaml
+```python
+for event in response:
+    if event.type == "response.output_text.delta":
+        print(event.delta, end="")
+    elif event.type == "response.output_item.added":
+        if event.item.type == "mcp_call":
+            print(f"Calling: {event.item.name}")
+    elif event.type == "response.output_item.done":
+        if event.item.type == "mcp_call":
+            print(f"Result: {event.item.output[:200]}")
+    elif event.type == "response.completed":
+        print("Done")
+    elif event.type == "response.failed":
+        print(f"Error: {event.response.error}")
 ```
-
-### Use `base_url` not `url` in vLLM provider config
-
-The RHOAI 0.4.x vLLM provider uses `base_url`. Using `url` is silently ignored:
-
-```yaml
-# Correct
-config:
-  base_url: ${env.VLLM_URL}
-
-# Wrong
-config:
-  url: ${env.VLLM_URL}
-```
-
-### Use `userConfig` not `userConfigMapRef`
-
-```yaml
-# Correct
-userConfig:
-  configMapName: llama-stack-run-config
-
-# Wrong -- silently ignored
-userConfigMapRef:
-  name: llama-stack-run-config
-```
-
-### PostgreSQL image uses `POSTGRESQL_*` env vars
-
-The Red Hat PostgreSQL image expects `POSTGRESQL_USER`, `POSTGRESQL_PASSWORD`,
-`POSTGRESQL_DATABASE` -- not `POSTGRES_*`.
-
-### NetworkPolicy blocks external route traffic by default
-
-The operator creates a NetworkPolicy that restricts ingress. The CR includes
-`network.allowedFrom.namespaces: ["*"]` to allow traffic from the OpenShift
-router.
 
 ## MCP Server Configuration
 
-### Safety Mode
+### Registering MCP toolgroups
+
+MCP servers are registered in the OGX config under `registered_resources.tool_groups`:
+
+```yaml
+registered_resources:
+  tool_groups:
+    - toolgroup_id: mcp::openshift
+      provider_id: model-context-protocol
+      mcp_endpoint:
+        uri: http://openshift-mcp-server:8080/sse
+
+    - toolgroup_id: mcp::victoriametrics
+      provider_id: model-context-protocol
+      mcp_endpoint:
+        uri: http://victoriametrics-mcp-aggregator:8000/sse
+```
+
+### Safety modes
 
 | Mode | Flag | What it allows |
 |------|------|----------------|
@@ -257,244 +308,62 @@ router.
 | Non-destructive | `--disable-destructive` | Read + create (no delete/update) |
 | Full access | (no flag) | All operations |
 
-### Enabled Toolsets
+## Authentication (OAuth2/Keycloak)
 
-| Toolset | Tools | Enabled |
-|---------|-------|---------|
-| `core` | pods, resources, events, namespaces, projects | Yes |
-| `config` | kubeconfig/context management | Yes |
-| `helm` | install, list, remove Helm charts | Yes |
-| `kubevirt` | VM management (OpenShift Virtualization) | No |
-| `observability` | Prometheus metrics, Alertmanager | No |
+OGX supports OAuth2 token authentication via Keycloak:
+
+```yaml
+server:
+  port: 8321
+  auth:
+    provider_config:
+      type: "oauth2_token"
+      jwks:
+        uri: "http://keycloak-service.rhbk.svc:8080/realms/aiops/protocol/openid-connect/certs"
+      issuer: "https://keycloak-route/realms/aiops"
+      audience: "account"
+```
+
+Client usage with auth:
+
+```python
+client = LlamaStackClient(
+    base_url="https://<ogx-route-url>",
+    api_key="<jwt-token>",
+)
+```
+
+## Migration from RHOAI 3.3
+
+### Breaking changes (v0.4.x → v0.7.x)
+
+| Area | Old (v0.4.x) | New (v0.7.x) |
+|------|-------------|-------------|
+| Config field | `image_name: rh` | `distro_name: rh` |
+| Agents provider | `inline::meta-reference` | `inline::builtin` |
+| Agents API | `agents` in apis list | `responses` in apis list |
+| TLS config | `tls_verify: false` | `network: { tls: { verify: false }}` |
+| RAG toolgroup | `builtin::rag` | `builtin::file_search` |
+| SDK version | `llama-stack-client>=0.4.0,<0.5` | `llama-stack-client>=0.7.0,<0.8` |
+| Removed APIs | — | `eval`, `scoring`, `datasetio`, `safety` |
+| Removed section | — | `registered_resources.tool_groups` auto-registers |
+
+### SDK changes
+
+```python
+# Import path is UNCHANGED
+from llama_stack_client import LlamaStackClient
+
+# New parameters available on responses.create():
+# parallel_tool_calls, max_output_tokens, max_tool_calls, reasoning, truncation
+
+# max_infer_iters replaced by max_tool_calls
+# extra_body={"truncation": "auto"} replaced by truncation="auto"
+```
 
 ## Adding a Remote OpenShift Cluster
 
-The default `openshift-mcp-server` uses an in-cluster ServiceAccount to talk to the local cluster. To reach a different OpenShift cluster, deploy a second MCP server pod with a kubeconfig that points at it.
-
-### 1. Create a ServiceAccount on the remote cluster
-
-Log in to the remote cluster and create a read-only ServiceAccount:
-
-```bash
-# Log in to the remote cluster
-oc login https://api.remote-cluster.example.com:6443
-
-# Create namespace and ServiceAccount
-oc new-project mcp
-oc create sa mcp-viewer -n mcp
-
-# Grant cluster-wide read access
-oc adm policy add-cluster-role-to-user cluster-reader \
-  system:serviceaccount:mcp:mcp-viewer
-```
-
-### 2. Generate a token and build a kubeconfig
-
-```bash
-# Generate a time-bound token (adjust duration as needed)
-TOKEN="$(oc -n mcp create token mcp-viewer --duration=8h)"
-API_SERVER="$(oc whoami --show-server)"
-
-# Build a dedicated kubeconfig file
-oc login --server="$API_SERVER" --token="$TOKEN" \
-  --kubeconfig="$HOME/.kube/mcp-remote.kubeconfig"
-
-# Verify
-oc --kubeconfig="$HOME/.kube/mcp-remote.kubeconfig" get nodes
-```
-
-> **Note:** ServiceAccount tokens expire after the specified duration. You will
-> need to regenerate the token and update the Secret when it expires. Use longer
-> durations for development (`--duration=168h` for 7 days).
-
-### 3. Create a Secret with the kubeconfig on the LlamaStack cluster
-
-Switch back to the LlamaStack cluster and store the kubeconfig as a Secret:
-
-```bash
-# Log in to the LlamaStack cluster
-oc login https://api.llamastack-cluster.example.com:6443
-oc project llama-stack
-
-# Create the Secret from the kubeconfig file
-oc create secret generic remote-cluster-kubeconfig \
-  --from-file=kubeconfig=$HOME/.kube/mcp-remote.kubeconfig
-```
-
-### 4. Deploy the remote MCP server
-
-Create `openshift-mcp-server-remote.yaml`:
-
-```yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: openshift-mcp-server-remote
-  labels:
-    app: openshift-mcp-server-remote
-    app.kubernetes.io/component: mcp-server
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: openshift-mcp-server-remote
-  template:
-    metadata:
-      labels:
-        app: openshift-mcp-server-remote
-        app.kubernetes.io/component: mcp-server
-    spec:
-      securityContext:
-        seccompProfile:
-          type: RuntimeDefault
-      containers:
-        - name: mcp-server
-          image: quay.io/containers/kubernetes_mcp_server:latest
-          args:
-            - "--port"
-            - "8080"
-            - "--disable-destructive"
-            - "--toolsets"
-            - "core,config,helm"
-            - "--kubeconfig"
-            - "/etc/mcp/kubeconfig"
-            - "--disable-multi-cluster"
-          ports:
-            - name: http
-              containerPort: 8080
-          volumeMounts:
-            - name: kubeconfig
-              mountPath: /etc/mcp
-              readOnly: true
-          securityContext:
-            allowPrivilegeEscalation: false
-            runAsNonRoot: true
-            capabilities:
-              drop:
-                - ALL
-          livenessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 10
-            periodSeconds: 20
-          readinessProbe:
-            httpGet:
-              path: /healthz
-              port: http
-            initialDelaySeconds: 3
-            periodSeconds: 10
-          resources:
-            requests:
-              cpu: 100m
-              memory: 128Mi
-            limits:
-              cpu: 100m
-              memory: 128Mi
-      volumes:
-        - name: kubeconfig
-          secret:
-            secretName: remote-cluster-kubeconfig
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: openshift-mcp-server-remote
-  labels:
-    app: openshift-mcp-server-remote
-spec:
-  selector:
-    app: openshift-mcp-server-remote
-  ports:
-    - name: http
-      port: 8080
-      targetPort: http
-  type: ClusterIP
-```
-
-Deploy it:
-
-```bash
-oc apply -f openshift-mcp-server-remote.yaml
-oc wait --for=condition=available deployment/openshift-mcp-server-remote --timeout=120s
-```
-
-### 5. Register the toolgroup in LlamaStack config
-
-Add the new toolgroup to `llamastack-config.yaml` under `tool_groups`:
-
-```yaml
-tool_groups:
-  # ... existing toolgroups ...
-  - toolgroup_id: mcp::openshift-remote
-    provider_id: model-context-protocol
-    mcp_endpoint:
-      uri: http://openshift-mcp-server-remote:8080/sse
-```
-
-Update the ConfigMap:
-
-```bash
-oc create configmap llama-stack-run-config \
-  --from-file=config.yaml=llamastack-config.yaml \
-  --dry-run=client -o yaml | oc apply -f -
-```
-
-Restart LlamaStack to pick up the new toolgroup:
-
-```bash
-oc rollout restart deployment/llama-stack-server
-```
-
-### 6. Query the remote cluster
-
-Use the Responses API with the `openshift-remote` server label:
-
-```python
-response = requests.post(
-    f"{LLAMA_STACK_URL}/v1/responses",
-    json={
-        "model": "your-inference-model",
-        "input": "List all pods in the default namespace",
-        "tools": [
-            {
-                "type": "mcp",
-                "server_label": "openshift-remote",
-                "server_url": "http://openshift-mcp-server-remote:8080/sse",
-                "require_approval": "never",
-            }
-        ],
-        "stream": False,
-    },
-    verify=False,
-    timeout=120,
-).json()
-```
-
-The `server_label` controls which cluster gets the request: `"openshift"` hits the local cluster, `"openshift-remote"` hits the remote one. To add more clusters, repeat steps 1-5 with different names.
-
-### Token renewal
-
-When the SA token expires, regenerate it and update the Secret:
-
-```bash
-# On the remote cluster
-oc login https://api.remote-cluster.example.com:6443
-TOKEN="$(oc -n mcp create token mcp-viewer --duration=8h)"
-API_SERVER="$(oc whoami --show-server)"
-oc login --server="$API_SERVER" --token="$TOKEN" \
-  --kubeconfig="$HOME/.kube/mcp-remote.kubeconfig"
-
-# On the LlamaStack cluster
-oc login https://api.llamastack-cluster.example.com:6443
-oc project llama-stack
-oc create secret generic remote-cluster-kubeconfig \
-  --from-file=kubeconfig=$HOME/.kube/mcp-remote.kubeconfig \
-  --dry-run=client -o yaml | oc apply -f -
-
-# Restart the MCP server to pick up the new token
-oc rollout restart deployment/openshift-mcp-server-remote
-```
+See the remote cluster setup guide in the previous version of this README. The process is unchanged — deploy a second MCP server pod with a kubeconfig pointing to the remote cluster, register it as `mcp::openshift-remote` in the OGX config.
 
 ## Updating Configuration
 
@@ -502,6 +371,9 @@ oc rollout restart deployment/openshift-mcp-server-remote
 oc create configmap llama-stack-run-config \
   --from-file=config.yaml=llamastack-config.yaml \
   --dry-run=client -o yaml | oc apply -f -
+
+# Restart to pick up changes
+oc rollout restart deployment/llama-stack-server
 ```
 
 ## Teardown
@@ -517,50 +389,29 @@ oc delete -f postgres.yaml
 envsubst < llama-stack-secret.yaml | oc delete -f -
 ```
 
-## Claude Code skill
-
-This repo includes a LlamaStack skill for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) at `.claude/skills/llamastack/SKILL.md`. It gives Claude context about LlamaStack APIs, deployment patterns, MCP integration, and common gotchas so it can help you work with this project.
-
-### What it covers
-
-- LlamaStack v0.4.x API reference (Responses API, tool invocation, chat completions)
-- MCP server registration and auth patterns (config-level vs request-time)
-- OpenShift deployment with the LlamaStackDistribution CR
-- Config file reference (`config.yaml` with env var interpolation)
-- 9 gotchas that will save you debugging time (silent field name mismatches, missing routes, etc.)
-
-### Setup
-
-The skill loads automatically when you use Claude Code inside this project directory. No extra setup needed -- Claude Code reads `.claude/skills/` from the repo root.
-
-You can invoke it directly:
-
-```
-/llamastack deploy    # deployment help
-/llamastack api       # API reference
-/llamastack mcp       # MCP server integration
-/llamastack gotchas   # common pitfalls
-```
-
-Or just ask questions naturally and Claude will pull from the skill when relevant.
-
-### Requirements
-
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI installed
-- Run `claude` from this repo's root directory
-
 ## Troubleshooting
 
-**LlamaStack pod in CrashLoopBackOff:**
+**OGX pod in CrashLoopBackOff:**
 - Check logs: `oc logs -l app.kubernetes.io/instance=llama-stack-server`
-- Verify ConfigMap key is `config.yaml`
+- Verify ConfigMap key is `config.yaml` (not `run.yaml`)
 - Verify `base_url` (not `url`) in vLLM provider config
+- Verify `distro_name` (not `image_name`)
+- Verify `inline::builtin` (not `inline::meta-reference`)
 
 **Route returns 503:**
 - Check NetworkPolicy: `oc get networkpolicy -o yaml`
-- Ensure `network.allowedFrom.namespaces: ["*"]` is set in the CR
+- Ensure `network.allowedFrom.namespaces: ["*"]` in the CR
 
 **MCP tools not appearing:**
-- Verify `mcp::openshift` is in `llamastack-config.yaml` under `tool_groups`
-- Verify `model-context-protocol` provider is under `providers.tool_runtime`
-- Check LlamaStack logs for MCP connection errors
+- Verify toolgroup entries in config under `registered_resources.tool_groups`
+- Verify `model-context-protocol` provider under `providers.tool_runtime`
+- Check OGX logs for MCP connection errors
+
+**Auth errors (401/403):**
+- Verify Keycloak JWKS URI is reachable from OGX pod
+- Verify `issuer` matches the external Keycloak route URL (JWT `iss` claim uses the external URL)
+- Check token expiry: `python3 -c "import jwt; print(jwt.decode(token, options={'verify_signature':False}))"`
+
+**Silent accuracy regression after upgrade:**
+- Upgrade OGX and vLLM atomically — Red Hat benchmarks show accuracy drops when only one is upgraded
+- Run test queries before and after to verify quality
